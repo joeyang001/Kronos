@@ -11,6 +11,19 @@ import warnings
 import datetime
 warnings.filterwarnings('ignore')
 
+# --- imports (top of app.py) ---
+import os
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from zoneinfo import ZoneInfo
+from flask import request, jsonify
+
+# === Config: external data root (outside project) ===
+DATA_ROOT = Path(os.environ.get("KRONOS_DATA_DIR", os.path.expanduser("~/KronosData"))).resolve()
+DATA_ROOT.mkdir(parents=True, exist_ok=True)  # ensure exists
+
 # Add project root directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -57,29 +70,68 @@ AVAILABLE_MODELS = {
     }
 }
 
+
+def _humansize(bytes_):
+    kb = bytes_ / 1024.0
+    if kb < 1024:
+        return f"{kb:.1f} KB"
+    mb = kb / 1024.0
+    return f"{mb:.2f} MB"
+
 def load_data_files():
-    """Scan data directory and return available data files"""
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
-    data_files = []
-    
-    if os.path.exists(data_dir):
-        for file in os.listdir(data_dir):
-            if file.endswith(('.csv', '.feather')):
-                file_path = os.path.join(data_dir, file)
-                file_size = os.path.getsize(file_path)
-                data_files.append({
-                    'name': file,
-                    'path': file_path,
-                    'size': f"{file_size / 1024:.1f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.1f} MB"
-                })
-    
-    return data_files
+    """
+    Return a flat list of CSV data files from BOTH:
+      - the in-repo data folder (webui/data)
+      - the external KRONOS_DATA_DIR (~/KronosData by default)
+    Each item: {name, path, size}
+    'name' is a friendly relative path within each root (e.g. 'AAPL/15m/US_15m_AAPL.csv').
+    """
+    files = []
+    seen = set()
+
+    project_data = Path(__file__).resolve().parent / "data"   # existing in-repo data
+    roots = [project_data, DATA_ROOT]
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.csv"):
+            try:
+                abs_path = str(p.resolve())
+            except FileNotFoundError:
+                continue
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+
+            # show a nice relative name inside that root (includes subfolders)
+            try:
+                display = str(p.relative_to(root))
+            except ValueError:
+                display = p.name
+
+            files.append({
+                "name": display,
+                "path": abs_path,
+                "size": _humansize(p.stat().st_size),
+            })
+
+    # Sort by display name (case-insensitive)
+    files.sort(key=lambda x: x["name"].lower())
+    return files
+
 
 def load_data_file(file_path):
     """Load data file"""
     try:
         if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, parse_dates=["timestamps"])
+            # Force UTC, then drop tz to make them naive-in-UTC
+            df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True) \
+                                    .dt.tz_convert("UTC") \
+                                    .dt.tz_localize(None)
+            # (optional sanity)
+            assert str(df["timestamps"].dtype) == "datetime64[ns]" 
         elif file_path.endswith('.feather'):
             df = pd.read_feather(file_path)
         else:
@@ -126,7 +178,8 @@ def save_prediction_results(file_path, prediction_type, prediction_results, actu
     """Save prediction results to file"""
     try:
         # Create prediction results directory
-        results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prediction_results')
+        # results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'prediction_results')
+        results_dir = os.path.join(DATA_ROOT, 'prediction_results')
         os.makedirs(results_dir, exist_ok=True)
         
         # Generate filename
@@ -696,6 +749,164 @@ def get_model_status():
             'loaded': False,
             'message': 'Kronos model library not available, please install related dependencies'
         })
+
+# Map UI label -> Yahoo interval and sensible default period
+INTERVAL_MAP = {
+    "5m":      {"yf": "5m",  "period": "60d"},
+    "15m":     {"yf": "15m", "period": "60d"},
+    "30m":     {"yf": "30m", "period": "60d"},            # a.k.a. half-hour
+    "hourly":  {"yf": "1h",  "period": "730d"},           # Yahoo limit ~730 days
+    "daily":   {"yf": "1d",  "period": "max"},
+    "weekly":  {"yf": "1wk", "period": "max"},
+    "monthly": {"yf": "1mo", "period": "max"},
+}
+
+def kronos_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize to Kronos columns: timestamps,open,high,low,close,volume,amount (UTC)."""
+    df = df.rename(columns={
+        "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"
+    })
+    for col in ("open", "high", "low", "close", "volume"):
+        if col not in df.columns:
+            df[col] = np.nan
+
+    # Ensure tz-aware -> UTC (handle naive just in case)
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("Expected DatetimeIndex")
+    if df.index.tz is None:
+        df = df.tz_localize("UTC")
+    else:
+        df = df.tz_convert("UTC")
+
+    df["amount"] = 0.0
+    df["timestamps"] = df.index.to_pydatetime()  # tz-aware UTC datetimes
+    cols = ["timestamps", "open", "high", "low", "close", "volume", "amount"]
+    return df[cols].reset_index(drop=True)
+
+def fetch_ohlcv(ticker: str, ui_interval: str, period: str | None = None,
+                start: str | None = None, end: str | None = None,
+                rth_only: bool = True, tz: str = "America/New_York") -> pd.DataFrame:
+    """
+    Generic OHLCV fetcher using yfinance.
+    ui_interval: one of ["5m","15m","30m","hourly","daily","weekly","monthly"].
+    - period or start/end: if both given, start/end wins.
+    - rth_only: keep only regular trading hours for intraday intervals.
+    Returns Kronos schema with tz-aware UTC timestamps.
+    """
+    ui_interval = ui_interval.lower()
+    if ui_interval not in INTERVAL_MAP:
+        raise ValueError(f"Unsupported interval: {ui_interval}")
+
+    yf_interval = INTERVAL_MAP[ui_interval]["yf"]
+    default_period = INTERVAL_MAP[ui_interval]["period"]
+    period = period or default_period
+
+    # 1) Download
+    if start or end:
+        df = yf.download(ticker, start=start, end=end, interval=yf_interval, auto_adjust=False, progress=False)
+    else:
+        df = yf.download(ticker, period=period, interval=yf_interval, auto_adjust=False, progress=False)
+
+    if df.empty:
+        raise ValueError(f"No data returned for {ticker} @ {ui_interval}")
+
+    # 2) Ensure index is tz-aware before any tz_convert
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("Unexpected index type from yfinance; expected DatetimeIndex.")
+    if df.index.tz is None:
+        # Daily/weekly/monthly commonly come in tz-naive. Assume UTC and localize.
+        df = df.tz_localize("UTC")
+
+    # 3) Intraday: filter to RTH in US/Eastern if requested
+    is_intraday = yf_interval.endswith("m") or yf_interval.endswith("h")
+    if rth_only and is_intraday:
+        df = df.tz_convert(ZoneInfo(tz))              # UTC -> US/Eastern
+        df = df.between_time("09:30", "16:00")
+        df = df.tz_convert("UTC")                     # back to UTC for output
+
+    # 4) Standardize columns + timestamps (UTC)
+    return kronos_schema(df)  # df is tz-aware here
+
+def save_ohlcv(df: pd.DataFrame, ticker: str, ui_interval: str) -> Path:
+    """Save to external data root: ~/KronosData/<TICKER>/<interval>/US_<interval>_<TICKER>.csv"""
+    t = ticker.upper()
+    subdir = DATA_ROOT / t / ui_interval
+    subdir.mkdir(parents=True, exist_ok=True)
+    out = subdir / f"US_{ui_interval}_{t}.csv"
+    df.to_csv(out, index=False)
+    return out
+
+def get_data_info(df: pd.DataFrame, ui_interval: str) -> dict:
+    pr = {"min": float(np.nanmin(df["close"])), "max": float(np.nanmax(df["close"]))}
+    start = pd.to_datetime(df["timestamps"].iloc[0]).isoformat()
+    end   = pd.to_datetime(df["timestamps"].iloc[-1]).isoformat()
+    return {
+        "rows": len(df),
+        "columns": df.columns.tolist(),
+        "start_date": start,
+        "end_date": end,
+        "price_range": pr,
+        "timeframe": ui_interval,
+        "prediction_columns": ["open","high","low","close"]
+    }
+
+# --- New: fetch and save endpoint ---
+@app.route("/api/fetch-data", methods=["POST"])
+def api_fetch_data():
+    """
+    Body:
+    {
+      "ticker": "AAPL",
+      "interval": "15m" | "30m" | "hourly" | "daily" | "weekly" | "monthly" | "5m",
+      "period": "60d" | "max" | null,
+      "start": "YYYY-MM-DD" (optional),
+      "end":   "YYYY-MM-DD" (optional),
+      "rth_only": true/false
+    }
+    """
+    try:
+        data = request.get_json(force=True)
+        ticker   = data.get("ticker", "").strip()
+        interval = data.get("interval", "").strip().lower()
+        period   = data.get("period")
+        start    = data.get("start")
+        end      = data.get("end")
+        rth_only = bool(data.get("rth_only", True))
+
+        if not ticker or not interval:
+            return jsonify({"success": False, "error": "ticker and interval are required"}), 400
+
+        df = fetch_ohlcv(ticker, interval, period=period, start=start, end=end, rth_only=rth_only)
+        path = save_ohlcv(df, ticker, interval)
+        info = get_data_info(df, interval)
+
+        return jsonify({
+            "success": True,
+            "message": f"Fetched {ticker} @ {interval}, saved to {str(path)}",
+            "file_path": str(path),
+            "data_info": info
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+
+# --- Optional: include external dir in your existing /api/data-files listing ---
+def list_data_files():
+    """Return [{name, path, size}] from both old project dir and external data root."""
+    files = []
+    roots = [
+        Path(__file__).resolve().parent / "data",  # your existing in-project data dir (if any)
+        DATA_ROOT
+    ]
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*.csv"):
+            size = f"{p.stat().st_size/1024:.1f} KB"
+            files.append({"name": p.name, "path": str(p.resolve()), "size": size})
+    # You likely already have a /api/data-files route—replace its body with:
+    # return jsonify(sorted(files, key=lambda x: x["name"]))
+    return files
+
 
 if __name__ == '__main__':
     print("Starting Kronos Web UI...")

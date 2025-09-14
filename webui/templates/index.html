@@ -4,6 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Kronos Financial Prediction Web UI</title>
+<!-- TradingView Lightweight Charts (UMD build exposes window.LightweightCharts) -->
+<script src="https://unpkg.com/lightweight-charts@4.2.1/dist/lightweight-charts.standalone.production.js" defer></script>
+
+<!-- Your renderer (uses the global LightweightCharts) -->
+<script src="{{ url_for('static', filename='js/kline.js') }}" defer></script>
+
+
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
     <style>
@@ -480,6 +487,91 @@
                 </button>
 
                 <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
+<!-- Ticker & Interval -->
+<div class="form-group">
+  <label for="ticker-input">Ticker:</label>
+  <input id="ticker-input" placeholder="AAPL" value="AAPL" />
+  <small class="form-text">Enter a US stock symbol (e.g., AAPL, MSFT)</small>
+</div>
+
+<div class="form-group">
+  <label for="interval-select">Interval:</label>
+  <select id="interval-select">
+    <option value="daily">Daily</option>
+    <option value="weekly">Weekly</option>
+    <option value="monthly">Monthly</option>
+    <option value="hourly">Hourly (1h)</option>
+    <option value="30m">Half-hour (30m)</option>
+    <option value="15m">15m</option>
+    <option value="5m">5m</option>
+  </select>
+  <small class="form-text">Choose the bar interval</small>
+</div>
+
+<button id="fetch-data-btn" class="btn">
+  📥 Fetch & Save Data
+</button>
+
+<script>
+// Map UI interval to a nice label (optional)
+const UI_INTERVAL_LABELS = {
+  "5m": "5 minutes", "15m": "15 minutes", "30m": "30 minutes",
+  "hourly": "1 hour", "daily": "1 day", "weekly": "1 week", "monthly": "1 month"
+};
+
+// Fetch from /api/fetch-data and wire into the existing flow
+async function fetchAndSaveData() {
+  const ticker = (document.getElementById('ticker-input').value || '').trim().toUpperCase();
+  const interval = document.getElementById('interval-select').value;
+
+  if (!ticker) {
+    showStatus('error', 'Please enter a ticker symbol.');
+    return;
+  }
+
+  try {
+    showLoading(true);
+    document.getElementById('fetch-data-btn').disabled = true;
+
+    // Period defaults are handled server-side; you can pass custom period/start/end here if desired
+    const resp = await axios.post('/api/fetch-data', {
+      ticker, interval, rth_only: true
+    });
+
+    if (!resp.data.success) {
+      showStatus('error', resp.data.error || 'Fetch failed');
+      return;
+    }
+
+    // 1) Update the current data file & info immediately
+    currentDataFile = resp.data.file_path;
+    currentDataInfo = resp.data.data_info;
+    showDataInfo(currentDataInfo);
+
+    // 2) Add/Select it in the dropdown so user can re-load later
+    const sel = document.getElementById('data-file-select');
+    const opt = document.createElement('option');
+    opt.value = resp.data.file_path;
+    opt.textContent = `${ticker} @ ${interval} (${UI_INTERVAL_LABELS[interval] || interval})`;
+    sel.appendChild(opt);
+    sel.value = resp.data.file_path;
+
+    showStatus('success', resp.data.message);
+
+    // If a model is already loaded, enable Predict
+    if (modelLoaded) {
+      document.getElementById('predict-btn').disabled = false;
+    }
+  } catch (err) {
+    console.error('Fetch failed:', err);
+    showStatus('error', `Fetch failed: ${err.response?.data?.error || err.message}`);
+  } finally {
+    showLoading(false);
+    document.getElementById('fetch-data-btn').disabled = false;
+  }
+}
+</script>
+
 
                 <!-- Data File Selection -->
                 <div class="form-group">
@@ -578,8 +670,33 @@
 
             <div class="chart-container">
                 <h2>📈 Prediction Results Chart</h2>
-                <div id="chart"></div>
-                
+                <!-- New: pretty K-line -->
+                <div id="kline-container" style="width:100%; height:600px;"></div>
+
+                <div class="kline-toolbar" style="display:flex;align-items:center;gap:.75rem;margin:.5rem 0 0 0;">
+                <span class="legend-dot" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#f59e0b;"></span>
+                <span style="font-size:.9rem;color:#9ca3af;">Prediction (close)</span>
+                <button id="toggle-pred-btn"
+                        style="margin-left:auto;padding:.35rem .7rem;border:none;border-radius:.5rem;background:#334155;color:#e5e7eb;cursor:pointer;">
+                    Hide prediction
+                </button>
+                </div>
+
+                <script>
+                // Toggle button behavior
+                document.addEventListener('DOMContentLoaded', () => {
+                    const btn = document.getElementById('toggle-pred-btn');
+                    if (!btn) return;
+                    btn.addEventListener('click', () => {
+                    const visible = window.klineAPI?.togglePred() ?? true;
+                    btn.textContent = visible ? 'Hide prediction' : 'Show prediction';
+                    });
+                });
+                </script>
+
+                <!-- Keep Plotly around (hidden) so comparison UI still works -->
+                <div id="chart" style="display:none;"></div>
+         
                 <!-- Comparison Analysis -->
                 <div id="comparison-section" class="comparison-section" style="display: none;">
                     <h3>📊 Prediction vs Actual Data Comparison</h3>
@@ -1083,6 +1200,8 @@
                 if (response.data.success) {
                     // Display prediction results
                     displayPredictionResult(response.data);
+                    // ⬇️ Add this call to draw the Lightweight Charts K-line
+                    drawKlineFromResult(response.data);
                     showStatus('success', response.data.message);
                 } else {
                     showStatus('error', response.data.error);
@@ -1099,8 +1218,8 @@
         // Display prediction results
         function displayPredictionResult(result) {
             // Display chart
-            const chartData = JSON.parse(result.chart);
-            Plotly.newPlot('chart', chartData.data, chartData.layout);
+            // const chartData = JSON.parse(result.chart);
+            // Plotly.newPlot('chart', chartData.data, chartData.layout);
             
             // Display comparison analysis (if actual data exists)
             if (result.has_comparison) {
@@ -1109,6 +1228,39 @@
                 document.getElementById('comparison-section').style.display = 'none';
             }
         }
+
+        // Map API result -> renderer input, then draw into #kline-container
+        function drawKlineFromResult(res) {
+            const history = extractHistoryFromPlotly(res.chart) || [];
+            const actual  = res.actual_data || res.actual || [];
+            const pred    = res.prediction_results || res.pred || [];
+            window.renderKlineChart({ history, actual, pred, markForecastStart: true }, 'kline-container');
+        }
+
+        // Fallback: if the server only returned Plotly JSON, pull the first candlestick trace as "history"
+        function extractHistoryFromPlotly(chartJsonString) {
+        try {
+            if (!chartJsonString) return [];
+            const chart = JSON.parse(chartJsonString);
+            const trace = (chart.data || []).find(t => (t.type || '').toLowerCase() === 'candlestick');
+            if (!trace) return [];
+            const x = trace.x || [];
+            const o = trace.open || [];
+            const h = trace.high || [];
+            const l = trace.low || [];
+            const c = trace.close || [];
+            const v = trace.volume || []; // may be absent
+            const out = [];
+            for (let i = 0; i < Math.min(x.length, o.length, h.length, l.length, c.length); i++) {
+            out.push({ timestamp: x[i], open: +o[i], high: +h[i], low: +l[i], close: +c[i], volume: +v[i] || 0 });
+            }
+            return out;
+        } catch (e) {
+            console.warn('extractHistoryFromPlotly failed:', e);
+            return [];
+        }
+        }
+
 
         // Display comparison analysis
         function displayComparisonAnalysis(result) {
@@ -1209,6 +1361,9 @@
             // Update slider when lookback window size changes
             document.getElementById('lookback').addEventListener('input', updateSliderFromInputs);
             document.getElementById('pred-len').addEventListener('input', updateSliderFromInputs);
+// inside setupEventListeners()
+document.getElementById('fetch-data-btn').addEventListener('click', fetchAndSaveData);
+
         }
 
         // Display status information

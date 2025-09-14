@@ -16,6 +16,7 @@ parts/
 sdist/
 var/
 wheels/
+webui/prediction_results/
 *.egg-info/
 .installed.cfg
 *.egg
